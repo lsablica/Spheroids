@@ -18,14 +18,14 @@ class SphericalClustering(nn.Module):
         self.A = nn.Linear(num_covariates, response_dim * num_clusters, bias=False)
 
         # Preallocate Pi as the log of uniform probabilities (no need for .to(device))
-        self.pi = torch.log(torch.ones(1, num_clusters) / num_clusters)  # Uniform Pi in log space
+        self.pi = torch.log(torch.ones(1, num_clusters) / num_clusters).to(device)  # Uniform Pi in log space
         # Preallocate W matrix (no need for .to(device))
         self.W = torch.zeros(1, num_clusters)  # Placeholder for the W matrix
         self.loglik = -1e10
 
         # Placeholder for the mask
-        self.mask = torch.ones(1, num_clusters, dtype=torch.bool)
-        self.mask_dynamic = torch.ones(1, num_clusters, dtype=torch.bool)
+        self.mask = torch.ones(1, num_clusters, dtype=torch.bool).to(device)
+        self.mask_dynamic = torch.ones(1, num_clusters, dtype=torch.bool).to(device)
 
     @property
     def active_components(self):
@@ -83,7 +83,7 @@ class SphericalClustering(nn.Module):
 
         mask2 = (new_pi >= self.min_weight)
         if torch.any(~mask2):
-            removed_clusters = (torch.arange(self.num_clusters)+1).unsqueeze(0)[self.mask][~mask2.squeeze()].tolist()
+            removed_clusters = (torch.arange(self.num_clusters)+1).unsqueeze(0).to(self.device)[self.mask][~mask2.squeeze()].tolist()
             updated_mask = self.mask.clone()  # Clone the current mask to avoid in-place memory issues
             updated_mask[self.mask] = mask2  # Only update the active part of the original mask
             self.mask = updated_mask
@@ -113,7 +113,7 @@ class SphericalClustering(nn.Module):
 
         return loss
     
-    def fit(self, X, Y, num_epochs=100, num_inner_steps=10, lr = 1e-3, tol = 1e-3, plot = True):
+    def fit(self, X, Y, num_epochs=100, num_inner_steps=10, lr = 1e-3, tol = 1e-4, plot = True):
         # Fit the model using EM algorithm
         X = X.to(self.device)
         Y = Y.to(self.device)
@@ -135,7 +135,7 @@ class SphericalClustering(nn.Module):
                 loglik = loglik[:, self.mask_dynamic.squeeze()]
             Loglikelihoods.append(self.loglik)
 
-            if torch.abs(self.loglik - models_loglik_old) < tol:
+            if torch.abs(self.loglik - models_loglik_old) < tol*100:
                 break
             models_loglik_old = self.loglik
 
@@ -165,6 +165,8 @@ class SphericalClustering(nn.Module):
         
         if plot:
             # plot the log-likelihoods over the epochs and return them
+            if self.device == 'cuda':
+                Loglikelihoods = [x.cpu().detach().numpy() for x in Loglikelihoods]
             plt.plot(range(epoch+1)[3:], Loglikelihoods[3:])
             plt.xlabel('Epochs')
             plt.ylabel('Log-likelihood')

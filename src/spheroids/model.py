@@ -1,14 +1,17 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import numpy as np
+import matplotlib.pyplot as plt
 
-class PKBDClustering(nn.Module):
-    def __init__(self, num_covariates, response_dim, num_clusters, min_weight=0.05, device='cpu'):
-        super(PKBDClustering, self).__init__()
+class SphericalClustering(nn.Module):
+    def __init__(self, num_covariates, response_dim, num_clusters, distribution = "pkbd", min_weight=0.05, device='cpu'):
+        super(SphericalClustering, self).__init__()
         self.num_covariates = num_covariates
         self.response_dim = response_dim
         self.num_clusters = num_clusters
         self.min_weight = torch.tensor(min_weight)
+        self.distribution = distribution
         self.device = device
 
         # Linear layer to map covariates X to K cluster embeddings (Cx(d*K))
@@ -23,7 +26,15 @@ class PKBDClustering(nn.Module):
         # Placeholder for the mask
         self.mask = torch.ones(1, num_clusters, dtype=torch.bool)
         self.mask_dynamic = torch.ones(1, num_clusters, dtype=torch.bool)
-        
+
+    @property
+    def active_components(self):
+        return torch.sum(self.mask).item()
+    
+    @property
+    def df(self):
+        return self.num_covariates * self.response_dim * self.active_components
+
     def forward(self, X):
         # Forward pass to map covariates X to embeddings
         N = X.size(0)
@@ -39,7 +50,7 @@ class PKBDClustering(nn.Module):
         
         return mu, rho
 
-    def log_likelihood(self, mu, rho, Y):
+    def log_likelihood(self, mu, rho, Y, distribution):
         # Calculate log likelihood for each cluster
         N, K, d = mu.shape
         Y = Y.unsqueeze(2)  # Shape: Nx1xd
@@ -47,9 +58,15 @@ class PKBDClustering(nn.Module):
         rho = rho.squeeze(-1)  # NxKx1 -> NxK
 
         term1 = torch.log(1 - rho ** 2)  # NxK
-        term2 = (d / 2) * torch.log(1 + rho ** 2 - 2 * rho * cross_prod)  # NxK
+        term2 = torch.log(1 + rho ** 2 - 2 * rho * cross_prod)  # NxK
 
-        loglik = term1 - term2  # Shape: NxK
+        if distribution == "pkbd":
+            loglik = term1 - d*term2/2 # Shape: NxK
+        elif distribution == "spcauchy":
+            loglik = (d-1)*term1 - (d-1)*term2  # Shape: NxK
+        else:
+            raise ValueError("Model must be 'pkbd' or 'spcauchy'")
+        
         return loglik
 
     def E_step(self, loglik_detached):
@@ -84,59 +101,96 @@ class PKBDClustering(nn.Module):
 
         return removed
 
-    def M_step(self, X, Y, optimizer, num_inner_steps=10):
+    def M_step(self, X, Y):
         # Perform full M-step with recalculation of model parameters and multiple optimization steps
-        for step in range(num_inner_steps):
-            optimizer.zero_grad()  # Reset gradients
-            mu, rho = self(X)
-            loglik = self.log_likelihood(mu, rho, Y)
-            # Perform backward pass based on the current W
-            W_colnorm = self.W / (torch.sum(self.W, dim=0, keepdim=True))  # Column normalize W
-            weighted_loglik = loglik * W_colnorm  # NxK element-wise multiplication
-            cluster_loglik = torch.sum(weighted_loglik, dim=0)  # 1xK
-            loss = -torch.mean(cluster_loglik)  # Minimize negative log likelihood
-            
-            loss.backward()
-            optimizer.step()  # Update model parameters
-            #if (step + 1) % 3 == 0:
-            #    print(f'   Inner_step {step + 2}/{num_inner_steps+1}, Loss: {loss.item()}')
-            
-        return loss.item()
-
-
-
-# Main EM loop
-# Main EM loop
-def train_em_model(X, Y, model, num_epochs=100, num_inner_steps=10, lr=1e-3):
-    optimizer = optim.AdamW(model.parameters(), lr=lr)
-    
-    X = X.to(model.device)
-    Y = Y.to(model.device)
-
-    for epoch in range(num_epochs):
-        # E-step
-        optimizer.zero_grad()
-        mu, rho = model(X)
-        loglik = model.log_likelihood(mu, rho, Y)
-        loglik_detached = loglik.detach()  # Detach the log-likelihood before the E-step
-        rem = model.E_step(loglik_detached)
-        if rem:
-            loglik = loglik[:, model.mask_dynamic.squeeze()]
-
-        W_colnorm = model.W / torch.sum(model.W, dim=0, keepdim=True)  # Column normalize W
+        mu, rho = self(X)
+        loglik = self.log_likelihood(mu, rho, Y, self.distribution)
+        # Perform backward pass based on the current W
+        W_colnorm = self.W / (torch.sum(self.W, dim=0, keepdim=True))  # Column normalize W
         weighted_loglik = loglik * W_colnorm  # NxK element-wise multiplication
         cluster_loglik = torch.sum(weighted_loglik, dim=0)  # 1xK
         loss = -torch.mean(cluster_loglik)  # Minimize negative log likelihood
-        loss.backward()
-        optimizer.step()
 
-        # Perform n-1 more M-steps with re-evaluations
-        loss = model.M_step(X, Y, optimizer, num_inner_steps=num_inner_steps - 1)
+        return loss
+    
+    def fit(self, X, Y, num_epochs=100, num_inner_steps=10, lr = 1e-3, tol = 1e-3, plot = True):
+        # Fit the model using EM algorithm
+        X = X.to(self.device)
+        Y = Y.to(self.device)
+        optimizer = optim.AdamW(self.parameters(), lr=lr)
 
-        if (epoch + 1) % 1 == 0:
-            print(f'Epoch {epoch + 1}/{num_epochs}, Loss: {loss}, Log-likelihood: {model.loglik}')
-       
-       
+        models_loglik_old = torch.tensor(-1e10)
+
+        Loglikelihoods = []
+
+        self.eval()
+        for epoch in range(num_epochs):
+            # E-step
+            optimizer.zero_grad()
+            mu, rho = self(X)
+            loglik = self.log_likelihood(mu, rho, Y, self.distribution)
+            loglik_detached = loglik.detach()  # Detach the log-likelihood before the E-step
+            rem = self.E_step(loglik_detached)
+            if rem:
+                loglik = loglik[:, self.mask_dynamic.squeeze()]
+            Loglikelihoods.append(self.loglik)
+
+            if torch.abs(self.loglik - models_loglik_old) < tol:
+                break
+            models_loglik_old = self.loglik
+
+            # M-step
+            W_colnorm = self.W / torch.sum(self.W, dim=0, keepdim=True)  # Column normalize W
+            weighted_loglik = loglik * W_colnorm  # NxK element-wise multiplication
+            cluster_loglik = torch.sum(weighted_loglik, dim=0)  # 1xK
+            loss = -torch.mean(cluster_loglik)  # Minimize negative log likelihood
+            loss.backward()
+            optimizer.step()
+
+            # Perform n-1 more M-steps with re-evaluations
+            old_loss = 1e10
+            for step in range(num_inner_steps):
+                optimizer.zero_grad()  # Reset gradients
+                loss = self.M_step(X, Y)
+                if abs(loss.item() - old_loss) < tol:
+                    print(f'   Inner_step {step + 1}/{num_inner_steps}, Loss: {loss.item()}')
+                    break
+                loss.backward()
+                optimizer.step()  # Update model parameters
+                old_loss = loss.item()
+            loss = loss.item()
+
+            if (epoch + 1) % 1 == 0:
+                print(f'Epoch {epoch + 1}/{num_epochs}, Loss: {loss}, Log-likelihood: {self.loglik}')
+        
+        if plot:
+            # plot the log-likelihoods over the epochs and return them
+            plt.plot(range(epoch+1)[3:], Loglikelihoods[3:])
+            plt.xlabel('Epochs')
+            plt.ylabel('Log-likelihood')
+            plt.title('Log-likelihood over epochs')
+        return Loglikelihoods
+    
+    def predict(self, X):
+        # Predict the cluster assignments
+        self.eval()
+        with torch.inference_mode():
+            X = X.to(self.device)
+            return self(X)
+
+    def predict_and_cluster(self, X, Y):
+        # Predict the cluster assignments and return the cluster assignments
+        self.eval()
+        with torch.inference_mode():
+            X = X.to(self.device)
+            Y = Y.to(self.device)
+            mu, rho = self(X)
+            loglik = self.log_likelihood(mu, rho, Y, self.distribution)
+            loglik_with_pi = loglik + self.pi  # Element-wise sum with log Pi vector
+            posterior = torch.softmax(loglik_with_pi, dim=1)
+            return posterior, mu, rho
+                  
+
 #device = 'cuda' if torch.cuda.is_available() else 'cpu'
 device = "cpu"
 N, C, d, K = 100, 2, 1024, 6  # Example dimensions
@@ -144,7 +198,7 @@ X = torch.randn(N, C)  # Covariates NxC
 Y = torch.randn(N, d)  # Response Nxd
 Y = Y / torch.norm(Y, dim=1, keepdim=True)  # Normalize Y
 
-model = PKBDClustering(num_covariates=C, response_dim=d, num_clusters=K, device=device)
-model.to(device)  # Move the entire model to the device
+model = SphericalClustering(num_covariates=C, response_dim=d, num_clusters=K, device=device)
+model.to(device)
 
-train_em_model(X, Y, model, num_epochs=200, num_inner_steps=10, lr=1e-3)
+loglikkkks = model.fit(X, Y, num_epochs=200, num_inner_steps=40, lr=1e-2)
